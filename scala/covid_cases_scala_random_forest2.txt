@@ -1,0 +1,135 @@
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.ml.feature.{VectorAssembler, StringIndexer}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.tuning.{CrossValidator, CrossValidatorModel, ParamGridBuilder}
+import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.sql.types.{IntegerType, DoubleType}
+import org.apache.spark.sql.functions._
+
+
+
+class TrainClassifier {
+    def getActiveCases(dataset: DataFrame): DataFrame = {
+        dataset.filter($"Outcome" === "ACTIVE")
+    }
+    def getPastCases(dataset: DataFrame): DataFrame = {
+        dataset.filter($"Outcome" =!= "ACTIVE")
+    }
+
+    def cleanDataset(dataset: DataFrame): DataFrame = {
+        //Remove Null values
+        val data_clean = dataset.na.drop(Seq("Age Group"))
+
+        //Cast dataset
+        val df_cast = data_clean.withColumn("Episode Date", to_date($"Episode Date", "yyyy-MM-dd"))
+                    .withColumn("Reported Date", to_date($"Reported Date", "yyyy-MM-dd"))
+                    .withColumn("_id",  $"_id".cast("int"))
+                    .withColumn("Assigned_ID",  $"Assigned_ID".cast("int"))
+
+        //Generate Days Since Episode column from Reported Date and Episode Date
+        val df_clean = df_cast.withColumn("Days Since Episode", datediff($"Reported Date", $"Episode Date"))
+                    .where($"Days Since Episode" >= 0)
+
+        //Select features to train the model
+        val df_select = df_clean.select("Outbreak Associated", "Age Group", "Source of Infection", "Classification", "Client Gender", "Outcome", "Days Since Episode",
+                          "Currently Hospitalized", "Currently in ICU", "Currently Intubated", "Ever Hospitalized", "Ever in ICU", "Ever Intubated")
+        df_select
+    }
+
+    def featureEngg(dataset: DataFrame): DataFrame = {
+        val indexer = new StringIndexer()
+      .setInputCols(Array("Outbreak Associated", "Age Group", "Source of Infection", "Classification", "Client Gender", "Outcome",
+                          "Currently Hospitalized", "Currently in ICU", "Currently Intubated", "Ever Hospitalized", "Ever in ICU", "Ever Intubated"))
+      .setOutputCols(Array("outbreakAssociatedIdx", "ageGroupIdx", "sourceOfInfectionIdx", "classificationIdx", "clientGenderIdx",
+                           "outcomeIdx", "currentlyHospitalizedIdx", "currentlyInICUIdx", "currentlyIntubatedIdx", "everHospitalizedIdx", "everInICUIdx", "everIntubatedIdx"))
+
+        val df = indexer.fit(dataset).transform(dataset)
+
+        val select_df = df.select("outbreakAssociatedIdx", "ageGroupIdx", "sourceOfInfectionIdx", "classificationIdx", "clientGenderIdx", "Days Since Episode",
+                           "outcomeIdx", "currentlyHospitalizedIdx", "currentlyInICUIdx", "currentlyIntubatedIdx", "everHospitalizedIdx", "everInICUIdx", "everIntubatedIdx")
+        select_df
+    }
+
+    def trainWithRandomForest(dataset: DataFrame): CrossValidatorModel = {
+
+        //Split dataset into Train and Test datasets
+        val Array(train_df, test_df) = dataset.randomSplit(Array(0.8, 0.2))
+
+        //VectorAssembler to merge multiple features into single feature
+        val assembler = new VectorAssembler()
+         .setInputCols(Array("outbreakAssociatedIdx", "ageGroupIdx", "sourceOfInfectionIdx", "classificationIdx", "clientGenderIdx", "Days Since Episode",
+                            "currentlyHospitalizedIdx", "currentlyInICUIdx", "currentlyIntubatedIdx", "everHospitalizedIdx", "everInICUIdx", "everIntubatedIdx"))
+         .setOutputCol("assembled-features")
+
+        //Train a classification model using RandomForestClassifier
+        val rf = new RandomForestClassifier()
+         .setFeaturesCol("assembled-features")
+         .setLabelCol("outcomeIdx")
+
+        //pipeline for assembler and classifier
+        val pipeline = new Pipeline()
+          .setStages(Array(assembler, rf))
+
+        //BinaryClassificationEvaluator to find the accuracy of the trained model
+        val evaluator = new BinaryClassificationEvaluator()
+          .setLabelCol("outcomeIdx")
+
+        //ParamGridBuilder to build different possible combination of parameters
+        val paramGrid = new ParamGridBuilder()  
+          .addGrid(rf.maxDepth, Array(3, 5))
+          .addGrid(rf.impurity, Array("entropy","gini")).build()
+
+        //K-Fold cross validation
+        val cross_validator = new CrossValidator()
+          .setEstimator(pipeline)
+          .setEvaluator(evaluator)
+          .setEstimatorParamMaps(paramGrid)
+          .setNumFolds(3)
+
+        //Fit training data to the classification model
+        val cvModel = cross_validator.fit(train_df)
+
+        //Find predictions with test dataset
+        val predictions = cvModel.transform(test_df)
+
+        //Find the accuracy of predicated values
+        val accuracy = evaluator.evaluate(predictions)
+
+        println("accuracy = " + accuracy)
+
+        cvModel
+    }
+    
+    def getPredictions(dataset: DataFrame) : DataFrame = {
+        val active_df = getActiveCases(dataset)
+        val data_df = getPastCases(dataset)
+        
+        val clean_df = cleanDataset(data_df)
+        val df_fengg = featureEngg(clean_df)
+        val trainedModel = trainWithRandomForest(df_fengg)
+        
+        val active_df_clean = cleanDataset(active_df)
+        val active_fengg_df = featureEngg(active_df_clean)
+
+        val active_df_prediction = trainedModel.transform(active_fengg_df)
+
+        active_df_prediction
+    }
+}
+
+val data = spark.read
+.format("csv")
+.option("header", "true")
+.load("hdfs://10.128.0.8:8020/BigData/COVID19_cases.csv")
+
+val active_df_prediction = new TrainClassifier().getPredictions(data)
+
+val fatal_count = active_df_prediction.select($"prediction").where($"prediction" === 1.0).count()
+val resolved_count = active_df_prediction.select($"prediction").where($"prediction" === 0.0).count()
+println("The Predicted Resolved cases: "+ resolved_count)
+println("The Predicted Fatal cases: "+ fatal_count)
+
